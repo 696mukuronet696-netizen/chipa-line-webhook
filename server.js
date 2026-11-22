@@ -259,7 +259,8 @@ function geminiAttempt(model, contents, systemText) {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            console.error(`Gemini API status ${res.statusCode} (model ${model})`);
+            const body = Buffer.concat(chunks).toString('utf8').slice(0, 300);
+            console.error(`Gemini API status ${res.statusCode} (model ${model}): ${body}`);
             resolve(null);
             return;
           }
