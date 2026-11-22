@@ -184,14 +184,13 @@ function fetchGroupMemberName(groupId, userId) {
   });
 }
 
-// Ask Gemini for a ちぱ-style reply. Returns the reply text, or null when
-// no key is configured or the call fails (caller then stays silent).
-function geminiReply(userText, systemText) {
-  if (!GEMINI_API_KEY) return Promise.resolve(null);
-  if (DRY_RUN) {
-    console.log('[DRY_RUN] gemini prompt:', JSON.stringify({ userText }));
-    return Promise.resolve(null);
-  }
+// Gemini models to try, in order. The first one that answers wins.
+// (gemini-2.0-flash returned 404 for this API key on 2026-11-23, so the
+// bot walks the list instead of depending on a single model name.)
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+
+// One Gemini call against one model. Returns the reply text or null.
+function geminiAttempt(model, userText, systemText) {
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: systemText }] },
     contents: [{ role: 'user', parts: [{ text: userText }] }],
@@ -201,7 +200,7 @@ function geminiReply(userText, systemText) {
     const req = https.request(
       {
         hostname: 'generativelanguage.googleapis.com',
-        path: '/v1beta/models/gemini-2.0-flash:generateContent',
+        path: `/v1beta/models/${model}:generateContent`,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -214,7 +213,7 @@ function geminiReply(userText, systemText) {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            console.error(`Gemini API status ${res.statusCode}`);
+            console.error(`Gemini API status ${res.statusCode} (model ${model})`);
             resolve(null);
             return;
           }
@@ -237,17 +236,33 @@ function geminiReply(userText, systemText) {
       }
     );
     req.on('error', (e) => {
-      console.error('Gemini request failed:', e.message);
+      console.error(`Gemini request failed (model ${model}):`, e.message);
       resolve(null);
     });
-    req.setTimeout(20000, () => {
-      console.error('Gemini request timed out');
+    req.setTimeout(15000, () => {
+      console.error(`Gemini request timed out (model ${model})`);
       req.destroy();
       resolve(null);
     });
     req.write(payload);
     req.end();
   });
+}
+
+// Ask Gemini for a ちぱ-style reply, walking GEMINI_MODELS until one
+// answers. Returns the reply text, or null when no key is configured or
+// every model fails (caller then stays silent).
+async function geminiReply(userText, systemText) {
+  if (!GEMINI_API_KEY) return null;
+  if (DRY_RUN) {
+    console.log('[DRY_RUN] gemini prompt:', JSON.stringify({ userText }));
+    return null;
+  }
+  for (const model of GEMINI_MODELS) {
+    const text = await geminiAttempt(model, userText, systemText);
+    if (text) return text;
+  }
+  return null;
 }
 
 // Handle one webhook event. Commands are answered in any talk. Other text
