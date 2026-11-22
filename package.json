@@ -1,0 +1,1 @@
+{"description":"LINE Messaging API webhook bot for ちぱ^._.^ (@099atngb). Node.js built-ins only.","engines":{"node":">=18"},"main":"server.js","name":"chipa-line-webhook-bot","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
