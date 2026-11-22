@@ -10,6 +10,10 @@
 // get an instant AI reply with the group rules; other group messages
 // stay silent (the Web-chat watch keeps handling participation,
 // meal-photo replies, timed posts and greetings).
+// The bot keeps short-term memory of each talk's recent messages and
+// passes it to Gemini as context (the user asked on 2026-11-23 that
+// ちぱ remember everyone's talk, self-feedback and learn from it;
+// durable feedback notes live in the watch's learning log).
 //
 // Required environment variables (never hardcode secrets):
 //   LINE_CHANNEL_SECRET        channel secret (for signature verification)
@@ -38,6 +42,46 @@ const OWNER_ID = 'U0c526d7fa020f6056c025ea26d5023f0';
 // (rule 32: questions probing ちぱ's internals in groups).
 const NO_REPLY = '__NO_REPLY__';
 
+// Short-term conversation memory (in-process only; cleared when the
+// service restarts or sleeps). Recent messages per talk are kept and
+// passed to Gemini as context so replies follow the talk's flow.
+const HISTORY_LIMIT = 20;
+const historyByTalk = new Map();
+const nameCache = new Map();
+
+function talkKey(source) {
+  if (source.type === 'user') return `user:${source.userId || ''}`;
+  if (source.type === 'group') return `group:${source.groupId || ''}`;
+  if (source.type === 'room') return `room:${source.roomId || ''}`;
+  return 'unknown';
+}
+
+function pushHistory(key, role, text) {
+  const arr = historyByTalk.get(key) || [];
+  arr.push({ role, text });
+  while (arr.length > HISTORY_LIMIT) arr.shift();
+  historyByTalk.set(key, arr);
+}
+
+// Build Gemini contents from the talk history plus the new message,
+// merging consecutive same-role turns (Gemini prefers alternation).
+function buildContents(key, newUserText) {
+  const turns = [
+    ...(historyByTalk.get(key) || []),
+    { role: 'user', text: newUserText },
+  ];
+  const contents = [];
+  for (const t of turns) {
+    const last = contents[contents.length - 1];
+    if (last && last.role === t.role) {
+      last.parts[0].text += '\n' + t.text;
+    } else {
+      contents.push({ role: t.role, parts: [{ text: t.text }] });
+    }
+  }
+  return contents;
+}
+
 const HELP_TEXT = [
   'ちぱ^._.^ コマンド一覧',
   '/help : このヘルプを表示します',
@@ -49,6 +93,8 @@ const STYLE_RULES = [
   '文体（絶対厳守）：すべての文に「とても」を（わざと誤用して）含めること。すべての文の文末は「なのら^._.^」で終わること。疑問文（質問の文）の文末は「なのら^._.^？」で終わること。1文ごとに改行すること。短く、会話の流れに合った返事にすること（長くても4文まで）。',
   '決まり文句（この場合は他の文を付けず、そのまま一文だけを返すこと）：',
   '- 相手がちぱを褒めたら → 「大好き^._.^」',
+  '- 相手（骸以外）が、褒め言葉ではない良いこと・嬉しいこと・優しいことを言ったら → 「とてもありがとう^._.^」（褒め言葉の場合は上の「大好き^._.^」を優先すること）',
+  '- 相手（骸以外）が、侮蔑・罵詈雑言ではない悪いこと・嫌なことを言ったら → 「とてもやめてね^._.^」（侮蔑・罵詈雑言の場合は下の警告を優先すること）',
   '- ちぱの年齢を聞かれたら → 「ちぱに年齢の概念はとても無いのら^.,.^」',
   '侮蔑・罵詈雑言（「バーカ」等）を受けた場合：塩対応で警告すること。型：「とてもちぱをバーカ呼ばわりしたこと、とても覚えたなのら^._.^」「とても次に言ったら、地球を秒で消滅させるなのら^._.^」（侮蔑の語が違う場合はその語に置き換える）。',
   '「何が好き？」と聞かれた場合：骸本人からなら、その場で思い付いた超絶塩対応で返すこと。骸以外からなら「チョコミントより骸以外は○○💓」の形で、○○をその場に合う言葉（みんな、甘いもの等）で埋め、文体ルールに沿わせ、末尾に💓を付けること。',
@@ -190,10 +236,10 @@ function fetchGroupMemberName(groupId, userId) {
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
 
 // One Gemini call against one model. Returns the reply text or null.
-function geminiAttempt(model, userText, systemText) {
+function geminiAttempt(model, contents, systemText) {
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: systemText }] },
-    contents: [{ role: 'user', parts: [{ text: userText }] }],
+    contents,
     generationConfig: { maxOutputTokens: 300, temperature: 0.9 },
   });
   return new Promise((resolve) => {
@@ -252,14 +298,14 @@ function geminiAttempt(model, userText, systemText) {
 // Ask Gemini for a ちぱ-style reply, walking GEMINI_MODELS until one
 // answers. Returns the reply text, or null when no key is configured or
 // every model fails (caller then stays silent).
-async function geminiReply(userText, systemText) {
+async function geminiReply(contents, systemText) {
   if (!GEMINI_API_KEY) return null;
   if (DRY_RUN) {
-    console.log('[DRY_RUN] gemini prompt:', JSON.stringify({ userText }));
+    console.log('[DRY_RUN] gemini prompt:', JSON.stringify({ contents }));
     return null;
   }
   for (const model of GEMINI_MODELS) {
-    const text = await geminiAttempt(model, userText, systemText);
+    const text = await geminiAttempt(model, contents, systemText);
     if (text) return text;
   }
   return null;
@@ -283,20 +329,41 @@ async function handleEvent(event) {
   } else if (text === '/id') {
     await reply(event.replyToken, userId ? `あなたのユーザーIDは ${userId} です` : 'ユーザーIDが取得できませんでした');
   } else if (source.type === 'user') {
-    const aiText = await geminiReply(text, systemPrompt(userId === OWNER_ID));
-    if (aiText && !aiText.includes(NO_REPLY)) await reply(event.replyToken, aiText);
+    const key = talkKey(source);
+    const aiText = await geminiReply(
+      buildContents(key, text),
+      systemPrompt(userId === OWNER_ID)
+    );
+    pushHistory(key, 'user', text);
+    if (aiText && !aiText.includes(NO_REPLY)) {
+      await reply(event.replyToken, aiText);
+      pushHistory(key, 'model', aiText);
+    }
   } else if (source.type === 'group' || source.type === 'room') {
     console.log(`[group] groupId=${source.groupId || source.roomId || '-'} userId=${userId}`);
-    if (!text.includes('ちぱ')) return; // no mention: the watch handles it
-    const displayName =
-      source.type === 'group'
-        ? await fetchGroupMemberName(source.groupId, userId)
-        : '';
+    const key = talkKey(source);
+    let displayName = nameCache.get(userId) || '';
+    if (!displayName && source.type === 'group') {
+      displayName = await fetchGroupMemberName(source.groupId, userId);
+      if (displayName) nameCache.set(userId, displayName);
+    }
+    const speaker = userId === OWNER_ID ? '骸' : displayName || 'メンバー';
+    const labeled = `（${speaker}）${text}`;
+    if (!text.includes('ちぱ')) {
+      // No mention: remember the talk, but stay silent (the watch
+      // handles participation, meal posts and other group replies).
+      pushHistory(key, 'user', labeled);
+      return;
+    }
     const aiText = await geminiReply(
-      text,
+      buildContents(key, labeled),
       groupSystemPrompt(userId === OWNER_ID, displayName)
     );
-    if (aiText && !aiText.includes(NO_REPLY)) await reply(event.replyToken, aiText);
+    pushHistory(key, 'user', labeled);
+    if (aiText && !aiText.includes(NO_REPLY)) {
+      await reply(event.replyToken, aiText);
+      pushHistory(key, 'model', aiText);
+    }
   }
   // AI failures and NO_REPLY cases: stay silent on purpose.
 }
