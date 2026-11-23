@@ -318,7 +318,7 @@ function fetchUserProfileName(userId) {
 // Gemini models to try, in order. The first one that answers wins.
 // (gemini-2.0-flash returned 404 for this API key on 2026-11-23, so the
 // bot walks the list instead of depending on a single model name.)
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
 
 // One Gemini call against one model. Returns the reply text or null.
 function geminiAttempt(model, contents, systemText) {
