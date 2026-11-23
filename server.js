@@ -384,15 +384,27 @@ function geminiAttempt(model, contents, systemText) {
 // Ask Gemini for a ちぱ-style reply, walking GEMINI_MODELS until one
 // answers. Returns the reply text, or null when no key is configured or
 // every model fails (caller then stays silent).
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function geminiReply(contents, systemText) {
   if (!GEMINI_API_KEY) return null;
   if (DRY_RUN) {
     console.log('[DRY_RUN] gemini prompt:', JSON.stringify({ contents }));
     return null;
   }
-  for (const model of GEMINI_MODELS) {
-    const text = await geminiAttempt(model, contents, systemText);
-    if (text) return text;
+  // gemini-3.8-flash answered 503 "high demand" (temporary) on
+  // 2026-11-23, so each model gets a few tries with short waits
+  // before the bot gives up and stays silent.
+  for (let m = 0; m < GEMINI_MODELS.length; m++) {
+    const model = GEMINI_MODELS[m];
+    const tries = m === 0 ? 3 : 2;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      if (attempt > 0) await sleep(attempt === 1 ? 3000 : 6000);
+      const text = await geminiAttempt(model, contents, systemText);
+      if (text) return text;
+    }
   }
   return null;
 }
